@@ -1,2 +1,4 @@
 com\yourname\imagejgui\Simple_GUI$Detection.class
 com\yourname\imagejgui\Simple_GUI.class
+com\yourname\imagejgui\Simple_GUI$LinkCandidate.class
+com\yourname\imagejgui\Simple_GUI$Track.class

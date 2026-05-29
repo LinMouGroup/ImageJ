@@ -4,6 +4,7 @@ import ij.IJ;
 import ij.ImagePlus;
 import ij.ImageStack;
 import ij.gui.Overlay;
+import ij.gui.Line;
 import ij.gui.OvalRoi;
 import ij.measure.ResultsTable;
 import ij.plugin.PlugIn;
@@ -16,10 +17,15 @@ import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.GridLayout;
+import java.awt.Dimension;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 public class Simple_GUI implements PlugIn {
 
@@ -32,6 +38,7 @@ public class Simple_GUI implements PlugIn {
     private JTextField detectionThresholdField;
     private JTextField localMaxRadiusField;
     private JTextField minDistanceField;
+    private JTextField trackingMaxDistanceField;
 
     private final List<Detection> lastDetections = new ArrayList<>();
 
@@ -82,18 +89,22 @@ public class Simple_GUI implements PlugIn {
 
         minDistanceField = new JTextField("6", 6);
         minDistanceField.setFont(chineseFont);
+        trackingMaxDistanceField = new JTextField("10", 6);
+        trackingMaxDistanceField.setFont(chineseFont);
 
         JLabel denoiseMethodLabel = new JLabel("降噪方法：");
         JLabel denoiseParameterLabel = new JLabel("降噪参数：");
         JLabel thresholdLabel = new JLabel("识别阈值：");
         JLabel radiusLabel = new JLabel("局部极大半径：");
         JLabel minDistanceLabel = new JLabel("最小距离：");
+        JLabel trackingDistanceLabel = new JLabel("追踪最大距离：");
 
         denoiseMethodLabel.setFont(chineseFont);
         denoiseParameterLabel.setFont(chineseFont);
         thresholdLabel.setFont(chineseFont);
         radiusLabel.setFont(chineseFont);
         minDistanceLabel.setFont(chineseFont);
+        trackingDistanceLabel.setFont(chineseFont);
 
         JTextArea logArea = new JTextArea();
         logArea.setEditable(false);
@@ -107,9 +118,7 @@ public class Simple_GUI implements PlugIn {
 
         detectButton.addActionListener(e -> detectParticles(logArea));
 
-        trackButton.addActionListener(e -> {
-            logArea.append("简单追踪功能将在 v0.5 添加。\n\n");
-        });
+        trackButton.addActionListener(e -> trackParticles(logArea));
 
         closeButton.addActionListener(e -> frame.dispose());
 
@@ -135,6 +144,8 @@ public class Simple_GUI implements PlugIn {
         row3.add(localMaxRadiusField);
         row3.add(minDistanceLabel);
         row3.add(minDistanceField);
+        row3.add(trackingDistanceLabel);
+        row3.add(trackingMaxDistanceField);
 
         JPanel row4 = new JPanel();
         row4.add(detectButton);
@@ -149,7 +160,12 @@ public class Simple_GUI implements PlugIn {
         frame.setLayout(new BorderLayout());
         frame.add(title, BorderLayout.NORTH);
         frame.add(controlPanel, BorderLayout.CENTER);
-        frame.add(new JScrollPane(logArea), BorderLayout.SOUTH);
+
+        JScrollPane logScrollPane = new JScrollPane(logArea);
+        logScrollPane.setPreferredSize(new Dimension(800, 150));
+        logScrollPane.setBorder(BorderFactory.createTitledBorder("日志区域"));
+
+        frame.add(logScrollPane, BorderLayout.SOUTH);
 
         frame.setVisible(true);
     }
@@ -338,6 +354,182 @@ public class Simple_GUI implements PlugIn {
         }
     }
 
+    private void trackParticles(JTextArea logArea) {
+        try {
+            logArea.append("开始执行简单追踪。\n");
+
+            if (lastDetections.isEmpty()) {
+                logArea.append("还没有颗粒识别结果，请先点击“识别颗粒”。\n\n");
+                return;
+            }
+
+            double maxLinkDistance = Double.parseDouble(trackingMaxDistanceField.getText());
+
+            if (maxLinkDistance <= 0) {
+                logArea.append("追踪最大距离必须大于 0。\n\n");
+                return;
+            }
+
+            ImagePlus imp = IJ.getImage();
+
+            if (imp == null) {
+                logArea.append("没有检测到当前图像。\n\n");
+                return;
+            }
+
+            Map<Integer, List<Detection>> detectionsByFrame = new HashMap<>();
+
+            int maxFrame = 0;
+
+            for (Detection detection : lastDetections) {
+                detectionsByFrame
+                        .computeIfAbsent(detection.frame, k -> new ArrayList<>())
+                        .add(detection);
+
+                if (detection.frame > maxFrame) {
+                    maxFrame = detection.frame;
+                }
+            }
+
+            List<Track> allTracks = new ArrayList<>();
+            int nextTrackId = 1;
+
+            for (int frame = 1; frame <= maxFrame; frame++) {
+
+                List<Detection> currentDetections =
+                        detectionsByFrame.getOrDefault(frame, new ArrayList<>());
+
+                if (frame == 1) {
+                    for (Detection detection : currentDetections) {
+                        Track track = new Track(nextTrackId, detection);
+                        allTracks.add(track);
+                        nextTrackId++;
+                    }
+                    continue;
+                }
+
+                List<Track> previousFrameTracks = new ArrayList<>();
+
+                for (Track track : allTracks) {
+                    Detection last = track.getLastDetection();
+
+                    if (last.frame == frame - 1) {
+                        previousFrameTracks.add(track);
+                    }
+                }
+
+                List<LinkCandidate> candidates = new ArrayList<>();
+
+                for (Track track : previousFrameTracks) {
+                    Detection last = track.getLastDetection();
+
+                    for (Detection detection : currentDetections) {
+                        double distance = distance(
+                                last.x,
+                                last.y,
+                                detection.x,
+                                detection.y
+                        );
+
+                        if (distance <= maxLinkDistance) {
+                            candidates.add(
+                                    new LinkCandidate(
+                                            track,
+                                            detection,
+                                            distance
+                                    )
+                            );
+                        }
+                    }
+                }
+
+                candidates.sort(Comparator.comparingDouble(c -> c.distance));
+
+                Set<Track> matchedTracks = new HashSet<>();
+                Set<Detection> matchedDetections = new HashSet<>();
+
+                for (LinkCandidate candidate : candidates) {
+
+                    if (matchedTracks.contains(candidate.track)) {
+                        continue;
+                    }
+
+                    if (matchedDetections.contains(candidate.detection)) {
+                        continue;
+                    }
+
+                    candidate.track.addDetection(candidate.detection);
+
+                    matchedTracks.add(candidate.track);
+                    matchedDetections.add(candidate.detection);
+                }
+
+                for (Detection detection : currentDetections) {
+                    if (!matchedDetections.contains(detection)) {
+                        Track newTrack = new Track(nextTrackId, detection);
+                        allTracks.add(newTrack);
+                        nextTrackId++;
+                    }
+                }
+            }
+
+            ResultsTable trackTable = new ResultsTable();
+
+            Overlay overlay = imp.getOverlay();
+
+            if (overlay == null) {
+                overlay = new Overlay();
+            }
+
+            for (Track track : allTracks) {
+
+                List<Detection> points = track.detections;
+
+                for (Detection detection : points) {
+                    trackTable.incrementCounter();
+                    trackTable.addValue("Track_ID", track.id);
+                    trackTable.addValue("Frame", detection.frame);
+                    trackTable.addValue("X", detection.x);
+                    trackTable.addValue("Y", detection.y);
+                    trackTable.addValue("Intensity", detection.intensity);
+                }
+
+                for (int i = 1; i < points.size(); i++) {
+
+                    Detection previous = points.get(i - 1);
+                    Detection current = points.get(i);
+
+                    Line line = new Line(
+                            previous.x,
+                            previous.y,
+                            current.x,
+                            current.y
+                    );
+
+                    line.setStrokeColor(Color.GREEN);
+                    line.setStrokeWidth(2);
+                    line.setPosition(current.frame);
+
+                    overlay.add(line);
+                }
+            }
+
+            imp.setOverlay(overlay);
+            trackTable.show("Track Results");
+
+            logArea.append("简单追踪完成。\n");
+            logArea.append("识别点总数：" + lastDetections.size() + "\n");
+            logArea.append("追踪最大距离：" + maxLinkDistance + "\n");
+            logArea.append("生成轨迹数量：" + allTracks.size() + "\n");
+            logArea.append("结果已显示在 Track Results 表格中。\n");
+            logArea.append("绿色线段表示相邻帧之间的连接。\n\n");
+
+        } catch (NumberFormatException ex) {
+            logArea.append("追踪参数输入错误，请输入数字，例如 10。\n\n");
+        } catch (Exception ex) {
+            logArea.append("追踪失败：" + ex.getMessage() + "\n\n");
+        }
+    }
     private List<Detection> findLocalMaxima(
             FloatProcessor fp,
             int frame,
@@ -535,6 +727,42 @@ public class Simple_GUI implements PlugIn {
             this.x = x;
             this.y = y;
             this.intensity = intensity;
+        }
+    }
+
+    private static class Track {
+
+        int id;
+        List<Detection> detections = new ArrayList<>();
+
+        Track(int id, Detection firstDetection) {
+            this.id = id;
+            addDetection(firstDetection);
+        }
+
+        void addDetection(Detection detection) {
+            detections.add(detection);
+        }
+
+        Detection getLastDetection() {
+            return detections.get(detections.size() - 1);
+        }
+    }
+
+    private static class LinkCandidate {
+
+        Track track;
+        Detection detection;
+        double distance;
+
+        LinkCandidate(
+                Track track,
+                Detection detection,
+                double distance
+        ) {
+            this.track = track;
+            this.detection = detection;
+            this.distance = distance;
         }
     }
 }
